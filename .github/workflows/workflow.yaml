@@ -270,6 +270,28 @@ jobs:
           XML_EOF
 
       # ---------- FLUTTER ----------
+      - name: Extract Flutter project ZIP (if exists)
+        if: env.type == 'flutter'
+        run: |
+          if [ -f flutter-project.zip ]; then
+            echo "📦 Extracting flutter-project.zip..."
+            unzip -q flutter-project.zip -d flutter-project
+            
+            # Ratakan jika zip berisi satu folder utama
+            FIRST_DIR=$(find flutter-project -mindepth 1 -maxdepth 1 -type d | head -n 1)
+            ROOT_FILES=$(find flutter-project -mindepth 1 -maxdepth 1 | wc -l)
+            
+            if [ "$ROOT_FILES" = "1" ] && [ -n "$FIRST_DIR" ] && [ -f "$FIRST_DIR/pubspec.yaml" ]; then
+              echo "📂 Found nested project, flattening structure..."
+              TMP_DIR=$(mktemp -d)
+              cp -R "$FIRST_DIR"/. "$TMP_DIR"/
+              rm -rf flutter-project
+              mkdir -p flutter-project
+              cp -R "$TMP_DIR"/. flutter-project/
+            fi
+            echo "✅ ZIP extracted successfully"
+          fi
+
       - name: Check if Flutter project exists
         if: env.type == 'flutter'
         run: |
