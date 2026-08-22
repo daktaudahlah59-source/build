@@ -1,0 +1,136 @@
+name: Flutter Panel Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+        type: string
+      telegram_file_id:
+        required: true
+        type: string
+      build_type:
+        required: true
+        type: string
+      build_mode:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BUILD_ID: ${{ inputs.build_id }}
+      TELEGRAM_FILE_ID: ${{ inputs.telegram_file_id }}
+      BUILD_TYPE: ${{ inputs.build_type }}
+      BUILD_MODE: ${{ inputs.build_mode }}
+      BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Prepare tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip jq curl
+
+      - name: Download ZIP from Telegram
+        shell: bash
+        run: |
+          set -euxo pipefail
+          test -n "${BOT_TOKEN}" || { echo "TELEGRAM_BOT_TOKEN repository secret is missing"; exit 1; }
+          FILE_JSON="$(curl -fsSL "https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${TELEGRAM_FILE_ID}")"
+          OK="$(echo "$FILE_JSON" | jq -r '.ok')"
+          test "$OK" = "true"
+          FILE_PATH="$(echo "$FILE_JSON" | jq -r '.result.file_path')"
+          curl -fL --retry 5 --retry-delay 2 \
+            "https://api.telegram.org/file/bot${BOT_TOKEN}/${FILE_PATH}" \
+            -o project.zip
+          ls -lh project.zip
+          test "$(stat -c%s project.zip)" -le $((2*1024*1024*1024))
+
+      - name: Extract project
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p project
+          unzip -q project.zip -d project
+          # Flatten a single top-level directory.
+          entries=(project/*)
+          if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
+            shopt -s dotglob
+            mv "${entries[0]}"/* project/ || true
+            rmdir "${entries[0]}" || true
+          fi
+          find project -maxdepth 2 -type f | head -100
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.35.0"
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        working-directory: project
+        run: flutter doctor -v
+
+      - name: Get dependencies
+        working-directory: project
+        run: flutter pub get
+
+      - name: Analyze project
+        working-directory: project
+        run: flutter analyze --no-fatal-infos
+
+      - name: Build Flutter
+        if: ${{ inputs.build_type == 'flutter' }}
+        working-directory: project
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ "${BUILD_MODE}" = "release" ]; then
+            flutter build apk --release --verbose
+          else
+            flutter build apk --debug --verbose
+          fi
+
+      - name: Build Web
+        if: ${{ inputs.build_type == 'web' }}
+        working-directory: project
+        run: flutter build web --release --verbose
+
+      - name: Package result
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p output
+          if [ "${BUILD_TYPE}" = "flutter" ]; then
+            cp -f project/build/app/outputs/flutter-apk/*.apk output/ || true
+          else
+            tar -czf output/flutter-web-${BUILD_ID}.tar.gz -C project build/web
+          fi
+          cat > output/build-info.txt <<EOF
+          Build ID: ${BUILD_ID}
+          Type: ${BUILD_TYPE}
+          Mode: ${BUILD_MODE}
+          Runner: ${RUNNER_NAME}
+          Finished: $(date -u)
+          EOF
+          ls -lh output
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-build-${{ inputs.build_id }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
