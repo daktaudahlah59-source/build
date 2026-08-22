@@ -1,0 +1,160 @@
+name: Flutter Panel Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+        type: string
+      user_id:
+        required: true
+        type: string
+      source_path:
+        required: true
+        type: string
+      release_id:
+        required: true
+        type: string
+      asset_id:
+        required: true
+        type: string
+      build_type:
+        required: true
+        type: string
+      build_mode:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      BUILD_ID: ${{ inputs.build_id }}
+      USER_ID: ${{ inputs.user_id }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      ASSET_ID: ${{ inputs.asset_id }}
+      BUILD_TYPE: ${{ inputs.build_type }}
+      BUILD_MODE: ${{ inputs.build_mode }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Prepare tools
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip curl jq
+          echo "Build: ${BUILD_ID}"
+          echo "User: ${USER_ID}"
+
+      - name: Download source ZIP from GitHub Release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}"
+
+          echo "Downloading release asset ${ASSET_ID}..."
+          curl -fL --retry 5 --retry-delay 3 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -o source.zip \
+            "${API}"
+
+          ls -lh source.zip
+          test -s source.zip
+          unzip -tq source.zip
+
+      - name: Extract project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf project
+          mkdir -p project
+          unzip -q source.zip -d project
+
+          entries=(project/*)
+          if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
+            shopt -s dotglob
+            mv "${entries[0]}"/* project/ || true
+            rmdir "${entries[0]}" || true
+          fi
+
+          test -f project/pubspec.yaml || {
+            echo "::error title=Flutter project tidak ditemukan::pubspec.yaml tidak ada."
+            find project -maxdepth 3 -type f | head -200
+            exit 1
+          }
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.35.0"
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        working-directory: project
+        run: flutter doctor -v
+
+      - name: Get dependencies
+        working-directory: project
+        run: flutter pub get
+
+      - name: Analyze project
+        working-directory: project
+        run: flutter analyze --no-fatal-infos
+
+      - name: Build Flutter
+        if: ${{ inputs.build_type == 'flutter' }}
+        working-directory: project
+        run: |
+          set -Eeuo pipefail
+          if [ "${BUILD_MODE}" = "release" ]; then
+            flutter build apk --release --verbose
+          else
+            flutter build apk --debug --verbose
+          fi
+
+      - name: Build Web
+        if: ${{ inputs.build_type == 'web' }}
+        working-directory: project
+        run: flutter build web --release --verbose
+
+      - name: Package result
+        run: |
+          set -Eeuo pipefail
+          rm -rf output
+          mkdir -p output
+
+          if [ "${BUILD_TYPE}" = "flutter" ]; then
+            cp -f project/build/app/outputs/flutter-apk/*.apk output/
+          else
+            tar -czf "flutter-web-${BUILD_ID}.tar.gz" -C project build/web
+            mv "flutter-web-${BUILD_ID}.tar.gz" output/
+          fi
+
+          cat > output/build-info.txt <<EOF
+          Build ID: ${BUILD_ID}
+          User ID: ${USER_ID}
+          Type: ${BUILD_TYPE}
+          Mode: ${BUILD_MODE}
+          Finished: $(date -u)
+          EOF
+
+      - name: Upload result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-build-${{ inputs.build_id }}
+          path: output/
+          if-no-files-found: ignore
+          retention-days: 7
