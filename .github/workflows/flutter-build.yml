@@ -1,0 +1,199 @@
+name: Flutter Panel Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+        type: string
+      telegram_file_id:
+        required: true
+        type: string
+      build_type:
+        required: true
+        type: string
+      build_mode:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BUILD_ID: ${{ inputs.build_id }}
+      TELEGRAM_FILE_ID: ${{ inputs.telegram_file_id }}
+      BUILD_TYPE: ${{ inputs.build_type }}
+      BUILD_MODE: ${{ inputs.build_mode }}
+      BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Prepare tools
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip jq curl
+          echo "Build ID: ${BUILD_ID}"
+          echo "Type: ${BUILD_TYPE}"
+          echo "Mode: ${BUILD_MODE}"
+
+      - name: Validate Telegram secret
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${BOT_TOKEN:-}" ]; then
+            echo "::error title=Telegram secret missing::Repository secret TELEGRAM_BOT_TOKEN is empty or missing."
+            exit 1
+          fi
+          echo "Telegram bot secret is configured."
+
+      - name: Download ZIP from Telegram with diagnostics
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Requesting Telegram getFile..."
+          HTTP_CODE="$(curl -sS -o file_info.json -w '%{http_code}' \
+            --retry 3 --retry-delay 2 \
+            "https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${TELEGRAM_FILE_ID}")"
+
+          echo "Telegram getFile HTTP: ${HTTP_CODE}"
+          cat file_info.json | jq . || cat file_info.json
+
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "::error title=Telegram getFile failed::HTTP ${HTTP_CODE}. See file_info.json output above."
+            exit 1
+          fi
+
+          OK="$(jq -r '.ok // false' file_info.json)"
+          if [ "${OK}" != "true" ]; then
+            DESC="$(jq -r '.description // "unknown Telegram API error"' file_info.json)"
+            echo "::error title=Telegram API rejected file::${DESC}"
+            exit 1
+          fi
+
+          FILE_PATH="$(jq -r '.result.file_path // empty' file_info.json)"
+          if [ -z "${FILE_PATH}" ]; then
+            echo "::error title=Telegram file path missing::getFile returned no file_path."
+            exit 1
+          fi
+
+          echo "Telegram file path: ${FILE_PATH}"
+
+          # IMPORTANT: the normal Telegram Bot API has a download-size limitation.
+          # Do not pretend that a normal Bot API URL can fetch a multi-GB ZIP.
+          echo "Downloading project ZIP..."
+          DOWNLOAD_CODE="$(curl -fL --retry 5 --retry-delay 3 \
+            -sS -o project.zip -w '%{http_code}' \
+            "https://api.telegram.org/file/bot${BOT_TOKEN}/${FILE_PATH}")" || {
+              RC=$?
+              echo "::error title=Telegram ZIP download failed::curl exit code ${RC}. Normal Telegram Bot API file downloads are limited; a ZIP over the Bot API limit cannot be downloaded this way."
+              exit ${RC}
+            }
+
+          echo "Download HTTP: ${DOWNLOAD_CODE}"
+          ls -lh project.zip
+
+          SIZE="$(stat -c%s project.zip)"
+          echo "Downloaded bytes: ${SIZE}"
+
+          if [ "${SIZE}" -eq 0 ]; then
+            echo "::error title=Empty ZIP::Telegram returned an empty file."
+            exit 1
+          fi
+
+          if ! unzip -tq project.zip; then
+            echo "::error title=Invalid ZIP::Downloaded file is not a valid ZIP archive. This usually means Telegram download failed or returned an error payload."
+            file project.zip || true
+            exit 1
+          fi
+
+      - name: Extract project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p project
+          unzip -q project.zip -d project
+
+          entries=(project/*)
+          if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
+            shopt -s dotglob
+            mv "${entries[0]}"/* project/ || true
+            rmdir "${entries[0]}" || true
+          fi
+
+          echo "Project files:"
+          find project -maxdepth 2 -type f | head -100
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.35.0"
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        working-directory: project
+        run: flutter doctor -v
+
+      - name: Get dependencies
+        working-directory: project
+        run: flutter pub get
+
+      - name: Analyze project
+        working-directory: project
+        run: flutter analyze --no-fatal-infos
+
+      - name: Build Flutter
+        if: ${{ inputs.build_type == 'flutter' }}
+        working-directory: project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ "${BUILD_MODE}" = "release" ]; then
+            flutter build apk --release --verbose
+          else
+            flutter build apk --debug --verbose
+          fi
+
+      - name: Build Web
+        if: ${{ inputs.build_type == 'web' }}
+        working-directory: project
+        run: flutter build web --release --verbose
+
+      - name: Package result
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p output
+
+          if [ "${BUILD_TYPE}" = "flutter" ]; then
+            cp -f project/build/app/outputs/flutter-apk/*.apk output/ || true
+          else
+            tar -czf "output/flutter-web-${BUILD_ID}.tar.gz" -C project build/web
+          fi
+
+          cat > output/build-info.txt <<EOF
+          Build ID: ${BUILD_ID}
+          Type: ${BUILD_TYPE}
+          Mode: ${BUILD_MODE}
+          Finished: $(date -u)
+          EOF
+
+          ls -lh output
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-build-${{ inputs.build_id }}
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
