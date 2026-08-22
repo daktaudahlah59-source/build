@@ -575,13 +575,15 @@ jobs:
           done
 
           # Sumber icon
+          # Flutter build TIDAK mengirim build-assets/icon.png ke branch.
+          # Jangan menulis ke ../build-assets karena folder tersebut memang tidak ada.
           if [ -f ../build-assets/icon.png ] && file ../build-assets/icon.png | grep -q PNG; then
             echo "✅ Using icon from build-assets/icon.png"
             ICON_SRC="../build-assets/icon.png"
           else
-            echo "⚠️ No valid icon found, creating default blue icon..."
-            convert -size 512x512 xc:blue ../build-assets/icon.png
-            ICON_SRC="../build-assets/icon.png"
+            echo "⚠️ No custom Flutter icon found, creating temporary default icon..."
+            ICON_SRC="/tmp/flutter_default_icon.png"
+            convert -size 512x512 xc:blue "$ICON_SRC"
           fi
 
           for dir in $MIPMAP_DIRS; do
