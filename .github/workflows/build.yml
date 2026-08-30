@@ -1,0 +1,103 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL download ZIP project Flutter"
+        required: true
+      tag:
+        description: "Tag build"
+        required: true
+      build_type:
+        description: "debug / release"
+        required: true
+        default: "release"
+      only_analyze:
+        description: "Hanya jalankan analyze (true/false)"
+        required: false
+        default: "false"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Download ZIP project
+        run: |
+          curl -L \
+            -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
+            -H "Accept: application/octet-stream" \
+            "${{ github.event.inputs.zip_url }}" \
+            -o project.zip
+
+      - name: Extract ZIP
+        run: |
+          unzip -q project.zip -d project_raw
+          
+          SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
+          FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
+          
+          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+            PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
+          else
+            PROJECT_DIR="project_raw"
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@main
+        with:
+          flutter-version: "3.41.9"
+          channel: "stable"
+          cache: true
+
+      - name: Analyze Project Code
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            flutter analyze > analyze_report.txt 2>&1 || true
+            cat analyze_report.txt
+          fi
+
+      - name: Get dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            timeout 120s flutter pub get || true
+          fi
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f "pubspec.yaml" ]; then
+            flutter build apk --${{ github.event.inputs.build_type }}
+          else
+            GRADLE_PATH=$(find . -name "gradlew" | head -n 1)
+            GRADLE_DIR=$(dirname "$GRADLE_PATH")
+            cd "$GRADLE_DIR" && chmod +x gradlew
+            if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
+              ./gradlew assembleDebug
+            else
+              ./gradlew assembleRelease
+            fi
+          fi
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/apk
+          retention-days: 1
