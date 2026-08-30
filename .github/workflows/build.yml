@@ -1,10 +1,11 @@
+# FLUTTER_BUILDER_WORKFLOW_V18_APK_DISCOVERY
 name: Build Flutter APK
 
 on:
   workflow_dispatch:
     inputs:
-      zip_url:
-        description: "URL download ZIP project Flutter"
+      user_id:
+        description: "User ID / folder project"
         required: true
       tag:
         description: "Tag build"
@@ -22,34 +23,38 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    
+    permissions:
+      contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
     steps:
+      - name: Checkout project repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "24"
 
-      - name: Download ZIP project
+      - name: Locate User Project
         run: |
-          curl -L \
-            -H "Authorization: Bearer ${{ secrets.GH_TOKEN }}" \
-            -H "Accept: application/octet-stream" \
-            "${{ github.event.inputs.zip_url }}" \
-            -o project.zip
-
-      - name: Extract ZIP
-        run: |
-          unzip -q project.zip -d project_raw
-          
-          SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
-          FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
-          
-          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
-            PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
-          else
-            PROJECT_DIR="project_raw"
+          USER_ROOT="builds/${{ github.event.inputs.user_id }}"
+          if [ ! -d "$USER_ROOT" ]; then
+            echo "❌ Folder project user tidak ditemukan: $USER_ROOT"
+            exit 1
           fi
-          echo "PROJECT_DIR=$PROJECT_DIR" >> $GITHUB_ENV
+          SUB_DIR_COUNT=$(find "$USER_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l)
+          FILE_COUNT=$(find "$USER_ROOT" -mindepth 1 -maxdepth 1 -type f | wc -l)
+          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+            PROJECT_DIR=$(find "$USER_ROOT" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          else
+            PROJECT_DIR="$USER_ROOT"
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=$PROJECT_DIR"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -65,18 +70,30 @@ jobs:
           cache: true
 
       - name: Analyze Project Code
+        if: ${{ github.event.inputs.build_type != 'debug' }}
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           if [ -f "pubspec.yaml" ]; then
             flutter analyze > analyze_report.txt 2>&1 || true
+            echo "[RESULT_ANALYZE]"
             cat analyze_report.txt
+            echo "[END_RESULT_ANALYZE]"
+            rm -f analyze_report.txt
+          else
+            echo "[RESULT_ANALYZE]"
+            echo "❌ pubspec.yaml tidak ditemukan."
+            echo "[END_RESULT_ANALYZE]"
           fi
+
+      - name: Stop if Analyze Only
+        if: ${{ github.event.inputs.only_analyze == 'true' }}
+        run: exit 1
 
       - name: Get dependencies
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           if [ -f "pubspec.yaml" ]; then
-            timeout 120s flutter pub get || true
+            timeout 120s flutter pub get || echo "⚠️ Lanjut..."
           fi
 
       - name: Build APK
@@ -95,9 +112,41 @@ jobs:
             fi
           fi
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: flutter-${{ github.event.inputs.build_type }}-${{ github.event.inputs.tag }}
-          path: ${{ env.PROJECT_DIR }}/build/app/outputs/apk
-          retention-days: 1
+      - name: Check APK Output
+        run: |
+          APK_FOUND=$(find "$GITHUB_WORKSPACE/$PROJECT_DIR" -name "*.apk" | head -n 1)
+          if [ -z "$APK_FOUND" ]; then
+            echo "❌ APK tidak ditemukan setelah build."
+            exit 1
+          fi
+          APK_PATH="$APK_FOUND"
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          echo "APK ditemukan: $APK_PATH"
+
+      - name: Publish APK to Temporary GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="build-${{ github.event.inputs.user_id }}-${{ github.run_id }}"
+
+          # Jangan percaya path APK lama/hard-coded. Cari artifact hasil build
+          # langsung dari workspace agar Flutter/Gradle project sama-sama aman.
+          APK_TO_PUBLISH="${APK_PATH:-}"
+          if [ -z "$APK_TO_PUBLISH" ] || [ ! -f "$APK_TO_PUBLISH" ]; then
+            echo "❌ APK hasil build tidak ditemukan di workspace."
+            echo "📂 Kandidat APK yang ada:"
+            find "$GITHUB_WORKSPACE" -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+          echo "📦 APK yang akan dipublish: $APK_TO_PUBLISH"
+
+          gh release create "$TAG" "$APK_TO_PUBLISH"             --repo "${GITHUB_REPOSITORY}"             --title "Temporary APK - User ${PROJECT_DIR##*/}"             --notes "Temporary APK asset; deleted after delivery."             --target "${GITHUB_SHA}"
+
+          echo "APK temporary release: $TAG" 
+
+      - name: Clear Runner Build Logs
+        if: always()
+        run: |
+          rm -rf build-logs || true
