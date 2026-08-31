@@ -1,0 +1,182 @@
+name: Flutter Analyze
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Temporary release tag"
+        required: true
+      user_id:
+        description: "User ID"
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.41.9"
+          channel: stable
+          cache: true
+
+      - name: Prepare report
+        run: |
+          mkdir -p analyze-report
+          : > analyze-report/analyze-report.txt
+
+      - name: Download ZIP project
+        id: download
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          ZIP_NAME: ${{ inputs.zip_name }}
+        run: |
+          set -o pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "❌ GH_TOKEN secret kosong/tidak tersedia."
+            exit 11
+          fi
+          echo "📦 Release: $TAG"
+          echo "📄 Asset: $ZIP_NAME"
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ZIP_NAME" \
+            --clobber
+          test -s "$ZIP_NAME"
+          mv "$ZIP_NAME" project.zip
+          file project.zip || true
+          unzip -t project.zip >/dev/null
+          echo "✅ ZIP berhasil di-download dan valid."
+
+      - name: Extract project
+        id: extract
+        if: steps.download.outcome == 'success'
+        continue-on-error: true
+        run: |
+          rm -rf project_raw
+          mkdir -p project_raw
+          unzip -q project.zip -d project_raw
+          SUB_DIR_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type d | wc -l)
+          FILE_COUNT=$(find project_raw -maxdepth 1 -mindepth 1 -type f | wc -l)
+          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+            PROJECT_DIR=$(find project_raw -maxdepth 1 -mindepth 1 -type d | head -n 1)
+          else
+            PROJECT_DIR="project_raw"
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Flutter pub get and analyze
+        id: analyze
+        if: steps.extract.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          REPORT="$GITHUB_WORKSPACE/analyze-report/analyze-report.txt"
+          PROJECT="${PROJECT_DIR:-project_raw}"
+
+          if [ ! -f "$PROJECT/pubspec.yaml" ]; then
+            {
+              echo "RESULT=ENGINE_ERROR"
+              echo "REASON=pubspec.yaml tidak ditemukan pada root project."
+            } > "$REPORT"
+            exit 0
+          fi
+
+          cd "$PROJECT"
+
+          flutter pub get > /tmp/pub_get.log 2>&1
+          PUB_CODE=$?
+
+          flutter analyze --format machine > /tmp/analyze_machine.log 2>&1
+          ANALYZE_CODE=$?
+
+          flutter analyze > /tmp/analyze_human.log 2>&1
+          HUMAN_CODE=$?
+
+          if [ "$ANALYZE_CODE" -ne 0 ] || [ "$HUMAN_CODE" -ne 0 ]; then
+            RESULT="SOURCE_ERROR"
+          elif [ "$PUB_CODE" -ne 0 ]; then
+            RESULT="DEPENDENCY_ERROR"
+          else
+            RESULT="PASS"
+          fi
+
+          {
+            echo "RESULT=$RESULT"
+            echo "PUB_GET_EXIT=$PUB_CODE"
+            echo "ANALYZE_MACHINE_EXIT=$ANALYZE_CODE"
+            echo "ANALYZE_HUMAN_EXIT=$HUMAN_CODE"
+            echo
+            echo "===== FLUTTER PUB GET ====="
+            cat /tmp/pub_get.log
+            echo
+            echo "===== FLUTTER ANALYZE MACHINE ====="
+            cat /tmp/analyze_machine.log
+            echo
+            echo "===== FLUTTER ANALYZE HUMAN ====="
+            cat /tmp/analyze_human.log
+            echo
+            echo "===== RAW OUTPUT ====="
+            cat /tmp/analyze_machine.log
+            cat /tmp/analyze_human.log
+          } > "$REPORT"
+
+      - name: Flutter compiler fallback
+        if: steps.analyze.outcome != 'success' || steps.analyze.conclusion == 'failure'
+        shell: bash
+        run: |
+          set +e
+          REPORT="$GITHUB_WORKSPACE/analyze-report/analyze-report.txt"
+          PROJECT="${PROJECT_DIR:-project_raw}"
+
+          if [ -f "$PROJECT/pubspec.yaml" ]; then
+            cd "$PROJECT"
+            flutter build apk --debug --no-pub > /tmp/build_fallback.log 2>&1
+            CODE=$?
+            {
+              echo
+              echo "===== FLUTTER BUILD FALLBACK ====="
+              echo "EXIT_CODE=$CODE"
+              cat /tmp/build_fallback.log
+            } >> "$REPORT"
+          fi
+
+      - name: Server engine failure report
+        if: steps.download.outcome != 'success' || steps.extract.outcome != 'success'
+        run: |
+          REPORT="$GITHUB_WORKSPACE/analyze-report/analyze-report.txt"
+          {
+            echo "RESULT=ENGINE_ERROR"
+            echo
+            echo "Analyze engine gagal menyiapkan project."
+            echo "Download outcome: ${{ steps.download.outcome }}"
+            echo "Extract outcome: ${{ steps.extract.outcome }}"
+            echo "Release tag: ${{ inputs.tag }}"
+            echo "Asset: ${{ inputs.zip_name }}"
+            echo
+            echo "Periksa log step 'Download ZIP project' untuk error gh release download sebenarnya."
+          } > "$REPORT"
+
+      - name: Upload analyze report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-analyze-report-${{ github.run_id }}
+          path: analyze-report/analyze-report.txt
+          retention-days: 1
