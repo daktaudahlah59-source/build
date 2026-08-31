@@ -1,0 +1,159 @@
+name: Flutter Analyze
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Temporary Analyze release tag"
+        required: true
+        type: string
+      zip_name:
+        description: "ZIP asset name"
+        required: true
+        type: string
+      user_id:
+        description: "User ID"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download ZIP project
+        id: download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          ZIP_NAME: ${{ inputs.zip_name }}
+        run: |
+          set -euo pipefail
+          echo "Downloading asset: $ZIP_NAME from release: $TAG"
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ZIP_NAME" \
+            --dir .
+          test -s "$ZIP_NAME"
+          unzip -t "$ZIP_NAME" >/dev/null
+
+      - name: Extract ZIP
+        id: extract
+        run: |
+          set -euo pipefail
+          rm -rf project_raw
+          mkdir -p project_raw
+          unzip -q "${{ inputs.zip_name }}" -d project_raw
+
+          SUB_DIR_COUNT=$(find project_raw -mindepth 1 -maxdepth 1 -type d | wc -l)
+          FILE_COUNT=$(find project_raw -mindepth 1 -maxdepth 1 -type f | wc -l)
+
+          if [ "$SUB_DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+            PROJECT_DIR="$(find project_raw -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          else
+            PROJECT_DIR="$GITHUB_WORKSPACE/project_raw"
+          fi
+
+          if [ ! -f "$PROJECT_DIR/pubspec.yaml" ]; then
+            echo "pubspec.yaml tidak ditemukan di root project."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Project directory: $PROJECT_DIR"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Run real build validation
+        id: engine
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set +e
+          : > "$GITHUB_WORKSPACE/analyze-report.txt"
+
+          echo "===== PROJECT STRUCTURE =====" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+          for f in pubspec.yaml android gradle.properties; do
+            if [ -e "$f" ]; then
+              echo "OK: $f" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+            else
+              echo "MISSING: $f" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+            fi
+          done
+
+          echo "" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+          echo "===== FLUTTER PUB GET =====" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+          flutter pub get > "$GITHUB_WORKSPACE/pubget.log" 2>&1
+          PUB_RC=$?
+          cat "$GITHUB_WORKSPACE/pubget.log" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+
+          if [ "$PUB_RC" -ne 0 ]; then
+            echo "" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+            echo "RESULT=DEPENDENCY_ERROR" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+            echo "===== RAW OUTPUT =====" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+            cat "$GITHUB_WORKSPACE/pubget.log" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+            exit 0
+          fi
+
+          echo "" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+          echo "===== FLUTTER ANALYZE =====" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+          flutter analyze > "$GITHUB_WORKSPACE/analyzer.log" 2>&1
+          ANALYZE_RC=$?
+          cat "$GITHUB_WORKSPACE/analyzer.log" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+
+          echo "" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+          echo "===== FLUTTER BUILD APK RELEASE =====" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+          flutter build apk --release > "$GITHUB_WORKSPACE/build.log" 2>&1
+          BUILD_RC=$?
+          cat "$GITHUB_WORKSPACE/build.log" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+
+          echo "" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+
+          # Build compiler failure is authoritative. Analyzer warnings alone
+          # do not fail the project.
+          if [ "$BUILD_RC" -ne 0 ]; then
+            echo "RESULT=SOURCE_ERROR" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+          else
+            echo "RESULT=PASS" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+          fi
+
+          echo "ANALYZE_EXIT=$ANALYZE_RC" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+          echo "BUILD_EXIT=$BUILD_RC" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+          echo "===== RAW OUTPUT =====" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+          cat "$GITHUB_WORKSPACE/build.log" >> "$GITHUB_WORKSPACE/analyze-report.txt"
+
+          # Do not fail this step: the report artifact must always be produced.
+          exit 0
+
+      - name: Upload Analyze Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-analyze-report-${{ github.run_id }}
+          path: analyze-report.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Publish result summary
+        if: always()
+        run: |
+          echo "Analyze report generated."
+          test -s analyze-report.txt
