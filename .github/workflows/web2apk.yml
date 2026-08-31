@@ -1,5 +1,8 @@
 name: Web2APK
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -234,7 +237,7 @@ jobs:
       - name: Publish APK to temporary GitHub Release
         if: success()
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
           USER_ID: ${{ github.event.inputs.user_id }}
           APK_PATH: myapp/build/app/outputs/flutter-apk/app-release.apk
         run: |
